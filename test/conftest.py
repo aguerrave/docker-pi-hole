@@ -1,11 +1,15 @@
-import pytest
-import testinfra
+
+import functools
 import os
+import pytest
+import subprocess
+import testinfra
+import types
 
-check_output = testinfra.get_backend(
-    "local://"
-).get_module("Command").check_output
+local_host = testinfra.get_host('local://')
+check_output = local_host.check_output
 
+DEBIAN_VERSION = os.environ.get('DEBIAN_VERSION', 'buster')
 __version__ = None
 dotdot = os.path.abspath(os.path.join(os.path.abspath(__file__), os.pardir, os.pardir))
 with open('{}/VERSION'.format(dotdot), 'r') as v:
@@ -13,8 +17,22 @@ with open('{}/VERSION'.format(dotdot), 'r') as v:
     __version__ = raw_version.replace('release/', 'release-')
 
 @pytest.fixture()
-def args_dns():
-    return '--dns 127.0.0.1 --dns 1.1.1.1'
+def run_and_stream_command_output():
+    def run_and_stream_command_output_inner(command, verbose=False):
+        print("Running", command)
+        build_env = os.environ.copy()
+        build_env['PIHOLE_VERSION'] = __version__
+        build_result = subprocess.Popen(command.split(), env=build_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        bufsize=1, universal_newlines=True)
+        if verbose:
+            while build_result.poll() is None:
+                for line in build_result.stdout:
+                    print(line, end='')
+        build_result.wait()
+        if build_result.returncode != 0:
+            print("     ::: Error running".format(command))
+            print(build_result.stderr)
+    return run_and_stream_command_output_inner
 
 @pytest.fixture()
 def args_volumes():
@@ -22,11 +40,11 @@ def args_volumes():
 
 @pytest.fixture()
 def args_env():
-    return '-e ServerIP="127.0.0.1" -e ServerIPv6="::1"'
+    return '-e ServerIP="127.0.0.1"'
 
 @pytest.fixture()
-def args(args_dns, args_volumes, args_env):
-    return "{} {} {}".format(args_dns, args_volumes, args_env)
+def args(args_volumes, args_env):
+    return "{} {}".format(args_volumes, args_env)
 
 @pytest.fixture()
 def test_args():
@@ -34,14 +52,14 @@ def test_args():
     return ''
 
 def DockerGeneric(request, _test_args, _args, _image, _cmd, _entrypoint):
-    assert 'docker' in check_output('id'), "Are you in the docker group?"
+    #assert 'docker' in check_output('id'), "Are you in the docker group?"
     # Always appended PYTEST arg to tell pihole we're testing
     if 'pihole' in _image and 'PYTEST=1' not in _args:
        _args = '{} -e PYTEST=1'.format(_args)
     docker_run = 'docker run -d -t {args} {test_args} {entry} {image} {cmd}'\
         .format(args=_args, test_args=_test_args, entry=_entrypoint, image=_image, cmd=_cmd)
     # Print a human runable version of the container run command for faster debugging
-    print docker_run.replace('-d -t', '--rm -it').replace('tail -f /dev/null', 'bash')
+    print(docker_run.replace('-d -t', '--rm -it').replace('tail -f /dev/null', 'bash'))
     docker_id = check_output(docker_run)
 
     def teardown():
@@ -49,24 +67,9 @@ def DockerGeneric(request, _test_args, _args, _image, _cmd, _entrypoint):
         check_output("docker rm -f {}".format(docker_id))
     request.addfinalizer(teardown)
 
-    docker_container = testinfra.get_backend("docker://" + docker_id)
+    docker_container = testinfra.backend.get_backend("docker://" + docker_id, sudo=False)
     docker_container.id = docker_id
 
-    def run_bash(self, command, *args, **kwargs):
-        cmd = self.get_command(command, *args)
-        if self.user is not None:
-            out = self.run_local(
-                "docker exec -u %s %s /bin/bash -c %s",
-                self.user, self.name, cmd)
-        else:
-            out = self.run_local(
-                "docker exec %s /bin/bash -c %s", self.name, cmd)
-        out.command = self.encode(cmd)
-        return out
-
-    funcType = type(docker_container.run)
-    # override run function to use bash not sh
-    docker_container.run = funcType(run_bash, docker_container, testinfra.backend.docker.DockerBackend)
     return docker_container
 
 
@@ -88,7 +91,7 @@ def DockerPersist(request, persist_test_args, persist_args, persist_image, persi
 def entrypoint():
     return ''
 
-@pytest.fixture(params=['amd64', 'armhf', 'aarch64'])
+@pytest.fixture(params=['amd64', 'armhf', 'arm64', 'armel'])
 def arch(request):
     return request.param
 
@@ -97,8 +100,12 @@ def version():
     return __version__
 
 @pytest.fixture()
-def tag(version, arch):
-    return '{}_{}'.format(version, arch)
+def debian_version():
+    return DEBIAN_VERSION
+
+@pytest.fixture()
+def tag(version, arch, debian_version):
+    return '{}-{}-{}'.format(version, arch, debian_version)
 
 @pytest.fixture
 def webserver(tag):
@@ -124,6 +131,10 @@ def persist_version():
     return __version__
 
 @pytest.fixture(scope='module')
+def persist_debian_version():
+    return DEBIAN_VERSION
+
+@pytest.fixture(scope='module')
 def persist_args_dns():
     return '--dns 127.0.0.1 --dns 1.1.1.1'
 
@@ -133,11 +144,11 @@ def persist_args_volumes():
 
 @pytest.fixture(scope='module')
 def persist_args_env():
-    return '-e ServerIP="127.0.0.1" -e ServerIPv6="::1"'
+    return '-e ServerIP="127.0.0.1"'
 
 @pytest.fixture(scope='module')
-def persist_args(persist_args_dns, persist_args_volumes, persist_args_env):
-    return "{} {} {}".format(args_dns, args_volumes, args_env)
+def persist_args(persist_args_volumes, persist_args_env):
+    return "{} {}".format(persist_args_volumes, persist_args_env)
 
 @pytest.fixture(scope='module')
 def persist_test_args():
@@ -145,8 +156,8 @@ def persist_test_args():
     return ''
 
 @pytest.fixture(scope='module')
-def persist_tag(persist_version, persist_arch):
-    return '{}_{}'.format(persist_version, persist_arch)
+def persist_tag(persist_version, persist_arch, persist_debian_version):
+    return '{}_{}_{}'.format(persist_version, persist_arch, persist_debian_version)
 
 @pytest.fixture(scope='module')
 def persist_webserver(persist_tag):
@@ -177,7 +188,7 @@ def Slow():
         while True:
             try:
                 assert check()
-            except AssertionError, e:
+            except AssertionError as e:
                 if time.time() < timeout_at:
                     time.sleep(1)
                 else:
